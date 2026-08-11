@@ -29,9 +29,9 @@ jobs:
       - name: Generate temporary release keystore
         run: |
           keytool -genkeypair -v \
-            -keystore release-keystore.jks \
-            -storepass "${{ secrets.RELEASE_STORE_PASSWORD || 'AssistantV4BuildOnly' }}" \
-            -keypass "${{ secrets.RELEASE_KEY_PASSWORD || 'AssistantV4BuildOnly' }}" \
+            -keystore "$GITHUB_WORKSPACE/release-keystore.jks" \
+            -storepass "AssistantV4BuildOnly" \
+            -keypass "AssistantV4BuildOnly" \
             -alias assistant-release \
             -keyalg RSA \
             -keysize 2048 \
@@ -40,10 +40,10 @@ jobs:
 
       - name: Build signed release APK
         env:
-          RELEASE_KEYSTORE: release-keystore.jks
-          RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD || 'AssistantV4BuildOnly' }}
+          RELEASE_KEYSTORE: "$GITHUB_WORKSPACE/release-keystore.jks"
+          RELEASE_STORE_PASSWORD: AssistantV4BuildOnly
           RELEASE_KEY_ALIAS: assistant-release
-          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD || 'AssistantV4BuildOnly' }}
+          RELEASE_KEY_PASSWORD: AssistantV4BuildOnly
         run: gradle :app:assembleRelease --stacktrace
 
       - name: Verify APK signature
