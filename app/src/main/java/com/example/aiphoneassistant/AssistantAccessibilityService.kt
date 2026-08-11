@@ -13,21 +13,49 @@ class AssistantAccessibilityService : AccessibilityService() {
         @Volatile var recordedSteps: MutableList<ActionStep> = mutableListOf()
     }
     private val handler = Handler(Looper.getMainLooper())
-    override fun onServiceConnected() { super.onServiceConnected(); instance = this }
+    private lateinit var store: SkillStore
+
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        store = SkillStore(this)
+        instance = this
+    }
+
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (!training || event?.eventType != AccessibilityEvent.TYPE_VIEW_CLICKED) return
         val source = event.source ?: return
         val text = source.text?.toString()?.trim().orEmpty()
         val viewId = source.viewIdResourceName?.trim().orEmpty()
-        when {
-            viewId.isNotEmpty() -> recordedSteps.add(ActionStep(ActionType.CLICK_ID, viewId, 350))
-            text.isNotEmpty() -> recordedSteps.add(ActionStep(ActionType.CLICK_TEXT, text, 350))
-        }
+        val step = when {
+            viewId.isNotEmpty() -> ActionStep(ActionType.CLICK_ID, viewId, 350)
+            text.isNotEmpty() -> ActionStep(ActionType.CLICK_TEXT, text, 350)
+            else -> null
+        } ?: return
+        recordedSteps.add(step)
+        store.saveTrainingDraft(recordedSteps)
     }
+
     override fun onInterrupt() {}
     override fun onDestroy() { instance = null; super.onDestroy() }
-    fun startTraining() { recordedSteps = mutableListOf(); training = true }
-    fun stopTraining(): List<ActionStep> { training = false; return recordedSteps.toList() }
+
+    fun startTraining() {
+        recordedSteps = mutableListOf()
+        store.saveTrainingDraft(recordedSteps)
+        training = true
+    }
+
+    fun stopTraining(): List<ActionStep> {
+        training = false
+        recordedSteps = store.loadTrainingDraft()
+        return recordedSteps.toList()
+    }
+
+    fun clearTrainingDraft() {
+        training = false
+        recordedSteps = mutableListOf()
+        store.clearTrainingDraft()
+    }
+
     fun execute(skill: Skill, callback: (String) -> Unit) {
         Thread {
             try {
@@ -40,11 +68,13 @@ class AssistantAccessibilityService : AccessibilityService() {
             } catch (e: Exception) { handler.post { callback("ERROR: ${e.message ?: "Unknown error"}") } }
         }.start()
     }
+
     private fun executeStep(step: ActionStep) {
         when (step.type) {
             ActionType.LAUNCH_APP -> {
                 val intent = packageManager.getLaunchIntentForPackage(step.value) ?: throw IllegalArgumentException("App not found: ${step.value}")
-                intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK); startActivity(intent)
+                intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                startActivity(intent)
             }
             ActionType.BACK -> performGlobalAction(GLOBAL_ACTION_BACK)
             ActionType.HOME -> performGlobalAction(GLOBAL_ACTION_HOME)
@@ -61,9 +91,13 @@ class AssistantAccessibilityService : AccessibilityService() {
             }
         }
     }
+
     private fun clickNodeOrParent(node: AccessibilityNodeInfo): Boolean {
         var current: AccessibilityNodeInfo? = node
-        repeat(5) { if (current?.isClickable == true) return current.performAction(AccessibilityNodeInfo.ACTION_CLICK); current = current?.parent }
+        repeat(5) {
+            if (current?.isClickable == true) return current.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            current = current?.parent
+        }
         return false
     }
 }
