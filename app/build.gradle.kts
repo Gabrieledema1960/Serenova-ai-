@@ -22,7 +22,8 @@ android {
             val keyAlias = System.getenv("RELEASE_KEY_ALIAS")
             val keyPassword = System.getenv("RELEASE_KEY_PASSWORD")
             if (!keystorePath.isNullOrBlank() && !storePassword.isNullOrBlank() && !keyAlias.isNullOrBlank() && !keyPassword.isNullOrBlank()) {
-                storeFile = rootProject.file(keystorePath)
+                // RELEASE_KEYSTORE is an absolute path supplied by GitHub Actions.
+                storeFile = file(keystorePath)
                 this.storePassword = storePassword
                 this.keyAlias = keyAlias
                 this.keyPassword = keyPassword
