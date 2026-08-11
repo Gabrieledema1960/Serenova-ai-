@@ -12,6 +12,7 @@ class AssistantAccessibilityService : AccessibilityService() {
         @Volatile var training = false
         @Volatile var recordedSteps: MutableList<ActionStep> = mutableListOf()
     }
+
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var store: SkillStore
 
@@ -26,12 +27,22 @@ class AssistantAccessibilityService : AccessibilityService() {
         val source = event.source ?: return
         val text = source.text?.toString()?.trim().orEmpty()
         val viewId = source.viewIdResourceName?.trim().orEmpty()
+        val packageName = source.packageName?.toString().orEmpty()
+
+        // Android's SystemUI navigation buttons are special: their nodes can disappear
+        // before replay, so record them as semantic global actions instead of raw IDs.
         val step = when {
-            viewId.isNotEmpty() -> ActionStep(ActionType.CLICK_ID, viewId, 350)
-            text.isNotEmpty() -> ActionStep(ActionType.CLICK_TEXT, text, 350)
+            packageName == "com.android.systemui" && viewId.endsWith("/home") ->
+                ActionStep(ActionType.HOME, "", 500)
+            packageName == "com.android.systemui" && viewId.endsWith("/recent_apps") ->
+                ActionStep(ActionType.RECENT_APPS, "", 500)
+            viewId.isNotEmpty() -> ActionStep(ActionType.CLICK_ID, viewId, 500)
+            text.isNotEmpty() -> ActionStep(ActionType.CLICK_TEXT, text, 500)
             else -> null
         } ?: return
+
         recordedSteps.add(step)
+        // Persist after every action so training survives app/process restarts.
         store.saveTrainingDraft(recordedSteps)
     }
 
@@ -61,41 +72,88 @@ class AssistantAccessibilityService : AccessibilityService() {
             try {
                 skill.steps.forEachIndexed { index, step ->
                     executeStep(step)
-                    handler.post { callback("Completed ${index + 1}/${skill.steps.size}: ${step.type}${if (step.value.isNotEmpty()) ": ${step.value}" else ""}") }
+                    handler.post {
+                        callback("Completed ${index + 1}/${skill.steps.size}: ${step.type}${if (step.value.isNotEmpty()) ": ${step.value}" else ""}")
+                    }
                     if (step.delayMs > 0) Thread.sleep(step.delayMs)
                 }
                 handler.post { callback("DONE") }
-            } catch (e: Exception) { handler.post { callback("ERROR: ${e.message ?: "Unknown error"}") } }
+            } catch (e: Exception) {
+                handler.post { callback("ERROR: ${e.message ?: "Unknown error"}") }
+            }
         }.start()
     }
 
     private fun executeStep(step: ActionStep) {
         when (step.type) {
             ActionType.LAUNCH_APP -> {
-                val intent = packageManager.getLaunchIntentForPackage(step.value) ?: throw IllegalArgumentException("App not found: ${step.value}")
+                val intent = packageManager.getLaunchIntentForPackage(step.value)
+                    ?: throw IllegalArgumentException("App not found: ${step.value}")
                 intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
                 startActivity(intent)
             }
             ActionType.BACK -> performGlobalAction(GLOBAL_ACTION_BACK)
             ActionType.HOME -> performGlobalAction(GLOBAL_ACTION_HOME)
+            ActionType.RECENT_APPS -> performGlobalAction(GLOBAL_ACTION_RECENTS)
             ActionType.WAIT -> Thread.sleep(step.value.toLongOrNull() ?: 1000)
             ActionType.CLICK_TEXT -> {
                 val root = rootInActiveWindow ?: throw IllegalStateException("No active window")
-                val node = root.findAccessibilityNodeInfosByText(step.value).firstOrNull { it.isVisibleToUser } ?: throw IllegalArgumentException("Text not found: ${step.value}")
+                val node = root.findAccessibilityNodeInfosByText(step.value)
+                    .firstOrNull { it.isVisibleToUser }
+                    ?: throw IllegalArgumentException("Text not found: ${step.value}")
                 if (!clickNodeOrParent(node)) throw IllegalStateException("Click failed")
             }
             ActionType.CLICK_ID -> {
+                // SystemUI navigation IDs are handled semantically as global actions.
+                when {
+                    step.value.endsWith("/home") && step.value.startsWith("com.android.systemui:") -> {
+                        if (!performGlobalAction(GLOBAL_ACTION_HOME)) throw IllegalStateException("Home action failed")
+                        return
+                    }
+                    step.value.endsWith("/recent_apps") && step.value.startsWith("com.android.systemui:") -> {
+                        if (!performGlobalAction(GLOBAL_ACTION_RECENTS)) throw IllegalStateException("Recent apps action failed")
+                        return
+                    }
+                }
+
                 val root = rootInActiveWindow ?: throw IllegalStateException("No active window")
-                val node = root.findAccessibilityNodeInfosByViewId(step.value).firstOrNull { it.isVisibleToUser } ?: throw IllegalArgumentException("View ID not found: ${step.value}")
-                if (!clickNodeOrParent(node)) throw IllegalStateException("Click failed")
+                val node = try {
+                    root.findAccessibilityNodeInfosByViewId(step.value).firstOrNull { it.isVisibleToUser }
+                } catch (_: Exception) { null }
+
+                if (node != null && clickNodeOrParent(node)) return
+
+                // Some Android/OEM apps expose a view ID while the current accessibility
+                // tree no longer exposes that exact ID. Fall back to matching the visible
+                // node's resource-name suffix or text instead of failing immediately.
+                val suffix = step.value.substringAfterLast(":id/").substringAfterLast("/")
+                val fallback = findClickableByResourceSuffix(root, suffix)
+                if (fallback != null && clickNodeOrParent(fallback)) return
+
+                throw IllegalArgumentException("View ID not found or not clickable: ${step.value}")
             }
         }
     }
 
+    private fun findClickableByResourceSuffix(root: AccessibilityNodeInfo, suffix: String): AccessibilityNodeInfo? {
+        if (suffix.isBlank()) return null
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        while (queue.isNotEmpty()) {
+            val node = queue.removeFirst()
+            val id = node.viewIdResourceName.orEmpty()
+            if (node.isVisibleToUser && id.substringAfterLast("/") == suffix) return node
+            for (i in 0 until node.childCount) node.getChild(i)?.let(queue::addLast)
+        }
+        return null
+    }
+
     private fun clickNodeOrParent(node: AccessibilityNodeInfo): Boolean {
         var current: AccessibilityNodeInfo? = node
-        repeat(5) {
-            if (current?.isClickable == true) return current.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+        repeat(7) {
+            if (current?.isVisibleToUser == true && current.isClickable) {
+                return current.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            }
             current = current?.parent
         }
         return false
