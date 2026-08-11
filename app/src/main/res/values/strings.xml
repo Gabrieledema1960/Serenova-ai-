@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">AI Phone Assistant</string>
+    <string name="accessibility_description">User-authorized assistant for executing user-created phone workflows.</string>
+</resources>
