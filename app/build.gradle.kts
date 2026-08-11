@@ -22,8 +22,6 @@ android {
             val keyAlias = System.getenv("RELEASE_KEY_ALIAS")
             val keyPassword = System.getenv("RELEASE_KEY_PASSWORD")
             if (!keystorePath.isNullOrBlank() && !storePassword.isNullOrBlank() && !keyAlias.isNullOrBlank() && !keyPassword.isNullOrBlank()) {
-                // Resolve from the Gradle root so an absolute GITHUB_WORKSPACE path is not
-                // incorrectly prefixed with the :app project directory.
                 storeFile = rootProject.file(keystorePath)
                 this.storePassword = storePassword
                 this.keyAlias = keyAlias
