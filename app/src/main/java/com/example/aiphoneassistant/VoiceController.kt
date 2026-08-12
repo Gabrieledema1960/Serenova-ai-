@@ -8,14 +8,7 @@ import android.os.Looper
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 
-/**
- * Reliable one-shot voice capture.
- *
- * Error 11 is ERROR_SERVER_DISCONNECTED, not a "bad microphone" error. The
- * recognizer must be destroyed and recreated before another startListening().
- * This controller also avoids overlapping sessions and retries transient
- * recognizer failures with a short backoff.
- */
+/** Reliable one-shot voice capture with recovery from Android recognizer errors. */
 class VoiceController(
     private val context: Context,
     private val onResult: (String) -> Unit,
@@ -23,14 +16,15 @@ class VoiceController(
 ) {
     private val main = Handler(Looper.getMainLooper())
     private var recognizer: SpeechRecognizer? = null
-    private var listening = false
     private var attempt = 0
     private var delivered = false
+    private var useSystemRecognizer = false
 
     fun start() {
         main.post {
             attempt = 0
             delivered = false
+            useSystemRecognizer = false
             startInternal()
         }
     }
@@ -46,6 +40,7 @@ class VoiceController(
 
         try {
             recognizer = if (
+                !useSystemRecognizer &&
                 Build.VERSION.SDK_INT >= 31 &&
                 SpeechRecognizer.isOnDeviceRecognitionAvailable(context)
             ) {
@@ -55,39 +50,33 @@ class VoiceController(
             }
 
             recognizer?.setRecognitionListener(object : android.speech.RecognitionListener {
-                override fun onReadyForSpeech(params: android.os.Bundle?) { listening = true }
+                override fun onReadyForSpeech(params: android.os.Bundle?) {}
                 override fun onBeginningOfSpeech() {}
                 override fun onRmsChanged(rmsdB: Float) {}
                 override fun onBufferReceived(buffer: ByteArray?) {}
-                override fun onEndOfSpeech() { listening = false }
+                override fun onEndOfSpeech() {}
                 override fun onPartialResults(partialResults: android.os.Bundle?) {}
                 override fun onEvent(eventType: Int, params: android.os.Bundle?) {}
 
                 override fun onResults(results: android.os.Bundle?) {
-                    listening = false
                     if (delivered) return
-                    delivered = true
                     val text = results
                         ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                         ?.firstOrNull()
                         ?.trim()
-                    destroyRecognizer()
                     if (!text.isNullOrBlank()) {
+                        delivered = true
+                        destroyRecognizer()
                         onResult(text)
                     } else {
-                        retryOrReport(SpeechRecognizer.ERROR_NO_MATCH)
+                        handleError(SpeechRecognizer.ERROR_NO_MATCH)
                     }
                 }
 
-                override fun onError(error: Int) {
-                    listening = false
-                    if (delivered) return
-                    destroyRecognizer()
-                    retryOrReport(error)
-                }
+                override fun onError(error: Int) = handleError(error)
             })
 
-            val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            recognizer?.startListening(Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-NG")
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "en-NG")
@@ -96,47 +85,51 @@ class VoiceController(
                 putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 800L)
                 putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1000L)
                 putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1200L)
-                // Do not force offline recognition. If the device has no local
-                // English model, that setting is a common cause of failures.
-            }
-            recognizer?.startListening(intent)
-        } catch (t: Throwable) {
-            listening = false
-            destroyRecognizer()
-            retryOrReport(SpeechRecognizer.ERROR_CLIENT)
+            })
+        } catch (_: Throwable) {
+            handleError(SpeechRecognizer.ERROR_CLIENT)
         }
     }
 
-    private fun retryOrReport(error: Int) {
+    private fun handleError(error: Int) {
+        if (delivered) return
+        destroyRecognizer()
+
+        // Error 11 = ERROR_SERVER_DISCONNECTED. If the on-device recognizer
+        // disconnected, immediately switch to Android's normal recognizer.
+        if (error == SpeechRecognizer.ERROR_SERVER_DISCONNECTED && !useSystemRecognizer) {
+            useSystemRecognizer = true
+            attempt = 0
+            main.postDelayed({ startInternal() }, 300L)
+            return
+        }
+
         val transient = error == SpeechRecognizer.ERROR_SERVER_DISCONNECTED ||
             error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY ||
             error == SpeechRecognizer.ERROR_CLIENT ||
             error == SpeechRecognizer.ERROR_NETWORK ||
             error == SpeechRecognizer.ERROR_NETWORK_TIMEOUT
 
-        // Never make the user press Listen repeatedly. Give the recognizer up
-        // to three clean sessions before reporting an error.
         if (transient && attempt < 3) {
-            val delay = 450L * (attempt + 1)
             attempt++
-            main.postDelayed({ startInternal() }, delay)
+            main.postDelayed({ startInternal() }, 450L * attempt)
             return
         }
 
         val message = when (error) {
             SpeechRecognizer.ERROR_SERVER_DISCONNECTED ->
-                "The speech service disconnected. I restarted it; please try speaking again."
+                "The speech service disconnected. I restarted it. Try speaking again."
             SpeechRecognizer.ERROR_RECOGNIZER_BUSY ->
-                "The speech service was busy. I restarted it for you."
+                "The speech service was busy. I reset it for you."
             SpeechRecognizer.ERROR_NETWORK,
             SpeechRecognizer.ERROR_NETWORK_TIMEOUT ->
-                "I couldn't reach the speech service. Check your connection and try again."
+                "The speech service couldn't connect. Check your internet connection and try again."
             SpeechRecognizer.ERROR_NO_MATCH,
             SpeechRecognizer.ERROR_SPEECH_TIMEOUT ->
-                "I didn't catch that. Speak a little closer to the phone and try again."
+                "I didn't catch that. Speak clearly and a little closer to the phone."
             SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS ->
-                "I don't have microphone permission yet. Please allow microphone access."
-            else -> "Voice recognition couldn't start (code $error). I reset the listener."
+                "I need microphone permission before I can hear you."
+            else -> "I couldn't hear that properly, so I reset the microphone."
         }
         onError(message)
     }
@@ -145,14 +138,14 @@ class VoiceController(
         try { recognizer?.cancel() } catch (_: Throwable) {}
         try { recognizer?.destroy() } catch (_: Throwable) {}
         recognizer = null
-        listening = false
     }
 
-    fun stop() {
-        main.post { destroyRecognizer() }
-    }
+    fun stop() { main.post { destroyRecognizer() } }
 
     fun destroy() {
-        main.post { destroyRecognizer(); main.removeCallbacksAndMessages(null) }
+        main.post {
+            destroyRecognizer()
+            main.removeCallbacksAndMessages(null)
+        }
     }
 }
